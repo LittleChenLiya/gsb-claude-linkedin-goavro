@@ -268,6 +268,53 @@ func main() {
 ```    
 The above code in [go playground](https://play.golang.org/p/RuHQONqBXeg)
 
+### Block receipts
+
+Every block frame an `OCFReader` starts gets an explicit
+`BlockReceipt`, available after reading via `BlockReceipts()`. A
+receipt records, without re-reading or re-decompressing the block:
+
+-   `DeclaredItems` (the block count in the frame) and
+    `DecodedItems` (records actually delivered)
+-   `CompressedSize` (on-disk payload bytes) and
+    `DecompressedSize`
+-   `SyncVerified` plus the `DataOffset`, `PayloadOffset`,
+    `SyncOffset`, and `EndOffset` byte positions in the original
+    input stream
+-   `Complete`, which is only true once every declared record was
+    decoded and the sync marker verified; a corrupt or truncated
+    block is never marked complete
+
+When a block fails, its receipt attributes the failure to a stage
+via `Stage`/`Err`: `BlockErrorTruncated` (the file ended mid frame),
+`BlockErrorFraming` (bad block count or size), `BlockErrorCodec`
+(decompression or datum decoding), `BlockErrorSync` (sync marker
+mismatch), or `BlockErrorCount` (declared count disagrees with the
+records actually present). A failure in one block does not rewrite
+receipts for blocks already delivered, and a failed block is not
+replayed after the error sticks.
+
+```go
+for ocfReader.Scan() {
+    if _, err := ocfReader.Read(); err != nil {
+        break
+    }
+}
+if err := ocfReader.Err(); err != nil {
+    for _, r := range ocfReader.BlockReceipts() {
+        fmt.Printf("block %d complete=%v stage=%s declared=%d decoded=%d\n",
+            r.Index, r.Complete, r.Stage, r.DeclaredItems, r.DecodedItems)
+    }
+}
+```
+
+See `examples/blockreceipt` for a runnable two-block example,
+including a corrupted second sync marker:
+
+```
+go run ./examples/blockreceipt
+```
+
 ### ab2t
 
 The `ab2t` program is similar to the reference standard

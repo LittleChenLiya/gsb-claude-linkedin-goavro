@@ -23,16 +23,26 @@ import (
 
 // OCFReader structure is used to read Object Container Files (OCF).
 type OCFReader struct {
-	header              *ocfHeader
-	block               []byte // buffer from which decoding takes place
-	rerr                error  // most recent error that took place while reading bytes (unrecoverable)
-	ior                 io.Reader
+	header *ocfHeader
+	block  []byte // buffer from which decoding takes place
+	rerr   error  // most recent error that took place while reading bytes (unrecoverable)
+	ior    io.Reader
+	// cr counts the bytes consumed from the original input stream, which lets
+	// block receipts report offsets without rescanning the stream.
+	cr                  *blockCountingReader
 	readReady           bool  // true after Scan and before Read
 	remainingBlockItems int64 // count of encoded data items remaining in block buffer to be decoded
+	receipts            []*BlockReceipt
 }
 
 // NewOCFReader initializes and returns a new structure used to read an Avro
 // Object Container File (OCF).
+//
+// Offsets reported by BlockReceipts are byte positions in the stream provided
+// here. When exact file offsets matter, pass the original stream (for example
+// an *os.File) rather than a reader that performs speculative readahead such
+// as bufio.Reader; a bufio.Reader may have consumed bytes beyond the current
+// block, making reported end offsets point past the block rather than at it.
 //
 //	func example(ior io.Reader) error {
 //	    // NOTE: Wrap provided io.Reader in a buffered reader, which improves the
@@ -52,11 +62,12 @@ type OCFReader struct {
 //	    return ocfr.Err()
 //	}
 func NewOCFReader(ior io.Reader) (*OCFReader, error) {
-	header, err := readOCFHeader(ior)
+	cr := &blockCountingReader{r: ior}
+	header, err := readOCFHeader(cr)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create OCFReader: %s", err)
 	}
-	return &OCFReader{header: header, ior: ior}, nil
+	return &OCFReader{header: header, ior: cr, cr: cr}, nil
 }
 
 // MetaData returns the file metadata map found within the OCF file
@@ -105,13 +116,34 @@ func (ocfr *OCFReader) Read() (interface{}, error) {
 	}
 	ocfr.readReady = false
 
+	// If the block buffer is exhausted while the frame claimed to hold more
+	// datum values, the declared block count was inflated. This is a framing
+	// count error rather than a codec error, and the block is not complete.
+	if len(ocfr.block) == 0 && ocfr.remainingBlockItems > 0 {
+		err := fmt.Errorf("block count mismatch: block declared %d items, but only %d items could be decoded",
+			ocfr.currentReceipt().DeclaredItems, ocfr.currentReceipt().DecodedItems)
+		ocfr.failBlock(BlockErrorCount, err)
+		return nil, err
+	}
+
 	// decode one datum value from block
 	var datum interface{}
 	datum, ocfr.block, ocfr.rerr = ocfr.header.codec.NativeFromBinary(ocfr.block)
 	if ocfr.rerr != nil {
+		ocfr.failBlock(BlockErrorCodec, fmt.Errorf("cannot decode datum: %s", ocfr.rerr))
 		return false, ocfr.rerr
 	}
 	ocfr.remainingBlockItems--
+
+	if b := ocfr.currentReceipt(); b != nil {
+		b.DecodedItems++
+		// A block is fully accounted for only when every declared datum
+		// value has been decoded with no bytes left over before the sync
+		// marker. Any later discrepancy clears Complete again.
+		if ocfr.remainingBlockItems == 0 && len(ocfr.block) == 0 {
+			b.Complete = true
+		}
+	}
 
 	return datum, nil
 }
@@ -120,6 +152,20 @@ func (ocfr *OCFReader) Read() (interface{}, error) {
 // processed.
 func (ocfr *OCFReader) RemainingBlockItems() int64 {
 	return ocfr.remainingBlockItems
+}
+
+// BlockReceipts returns a copy of the explicit receipts for every block frame
+// the reader has started so far, in stream order. A receipt is appended as
+// soon as a block frame begins and is never removed, so blocks delivered
+// before a later failure remain recorded and are not replayed. Each receipt
+// is populated incrementally while the block is streamed and decoded; the
+// reader never decompresses or rescans a block just to compute statistics.
+func (ocfr *OCFReader) BlockReceipts() []BlockReceipt {
+	out := make([]BlockReceipt, len(ocfr.receipts))
+	for i, b := range ocfr.receipts {
+		out[i] = *b
+	}
+	return out
 }
 
 // Scan returns true when there is at least one more data item to be read from
@@ -137,105 +183,124 @@ func (ocfr *OCFReader) Scan() bool {
 	// then attempt to slurp in the next block.
 	if ocfr.remainingBlockItems <= 0 {
 		if count := len(ocfr.block); count != 0 {
-			ocfr.rerr = fmt.Errorf("extra bytes between final datum in previous block and block sync marker: %d", count)
-			return false
+			// The producer claimed a smaller block count than the block
+			// actually holds: decoded datum values did not consume it all.
+			err := fmt.Errorf("block count mismatch: %d extra bytes between final datum and block sync marker", count)
+			return ocfr.failBlock(BlockErrorCount, err)
 		}
 
+		// Open the block receipt before consuming any byte of its frame so
+		// DataOffset anchors at the first byte of the block count long.
+		b := ocfr.beginBlockReceipt()
+
 		// Read the block count and update the number of remaining items for
-		// this block
+		// this block.
 		ocfr.remainingBlockItems, ocfr.rerr = longBinaryReader(ocfr.ior)
 		if ocfr.rerr != nil {
-			if ocfr.rerr == io.EOF {
-				ocfr.rerr = nil // merely end of file, rather than error
-			} else {
-				ocfr.rerr = fmt.Errorf("cannot read block count: %s", ocfr.rerr)
+			if ocfr.rerr == io.EOF && b.DataOffset == ocfr.cr.consumed {
+				// clean end of file: the block frame never started, so drop
+				// the empty receipt and report ordinary completion.
+				ocfr.receipts = ocfr.receipts[:len(ocfr.receipts)-1]
+				ocfr.rerr = nil
+				return false
 			}
-			return false
+			if ocfr.rerr == io.EOF || ocfr.rerr == io.ErrUnexpectedEOF {
+				return ocfr.failBlock(BlockErrorTruncated, fmt.Errorf("cannot read block count: %s", ocfr.rerr))
+			}
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot read block count: %s", ocfr.rerr))
 		}
+
+		b.DeclaredItems = ocfr.remainingBlockItems
 		if ocfr.remainingBlockItems <= 0 {
-			ocfr.rerr = fmt.Errorf("cannot decode when block count is not greater than 0: %d", ocfr.remainingBlockItems)
-			return false
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot decode when block count is not greater than 0: %d", ocfr.remainingBlockItems))
 		}
 		if ocfr.remainingBlockItems > MaxBlockCount {
-			ocfr.rerr = fmt.Errorf("cannot decode when block count exceeds MaxBlockCount: %d > %d", ocfr.remainingBlockItems, MaxBlockCount)
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot decode when block count exceeds MaxBlockCount: %d > %d", ocfr.remainingBlockItems, MaxBlockCount))
 		}
 
 		var blockSize int64
 		blockSize, ocfr.rerr = longBinaryReader(ocfr.ior)
 		if ocfr.rerr != nil {
-			ocfr.rerr = fmt.Errorf("cannot read block size: %s", ocfr.rerr)
-			return false
+			if ocfr.rerr == io.EOF || ocfr.rerr == io.ErrUnexpectedEOF {
+				return ocfr.failBlock(BlockErrorTruncated, fmt.Errorf("cannot read block size: %s", ocfr.rerr))
+			}
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot read block size: %s", ocfr.rerr))
 		}
 		if blockSize <= 0 {
-			ocfr.rerr = fmt.Errorf("cannot decode when block size is not greater than 0: %d", blockSize)
-			return false
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot decode when block size is not greater than 0: %d", blockSize))
 		}
 		if blockSize > MaxBlockSize {
-			ocfr.rerr = fmt.Errorf("cannot decode when block size exceeds MaxBlockSize: %d > %d", blockSize, MaxBlockSize)
-			return false
+			return ocfr.failBlock(BlockErrorFraming, fmt.Errorf("cannot decode when block size exceeds MaxBlockSize: %d > %d", blockSize, MaxBlockSize))
 		}
+
+		b.CompressedSize = blockSize
+		b.PayloadOffset = ocfr.cr.consumed
 
 		// read entire block into buffer
 		ocfr.block = make([]byte, blockSize)
-		_, ocfr.rerr = io.ReadFull(ocfr.ior, ocfr.block)
-		if ocfr.rerr != nil {
-			ocfr.rerr = fmt.Errorf("cannot read block: %s", ocfr.rerr)
-			return false
+		if _, ocfr.rerr = io.ReadFull(ocfr.ior, ocfr.block); ocfr.rerr != nil {
+			b.EndOffset = ocfr.cr.consumed
+			return ocfr.failBlock(BlockErrorTruncated, fmt.Errorf("cannot read block: %s", ocfr.rerr))
 		}
 
 		switch ocfr.header.compressionID {
 		case compressionNull:
-			// no-op
+			b.DecompressedSize = int64(len(ocfr.block))
 
 		case compressionDeflate:
 			// NOTE: flate.NewReader wraps with io.ByteReader if argument does
 			// not implement that interface.
 			rc := flate.NewReader(bytes.NewBuffer(ocfr.block))
-			ocfr.block, ocfr.rerr = io.ReadAll(rc)
+			var decoded []byte
+			decoded, ocfr.rerr = io.ReadAll(rc)
 			if ocfr.rerr != nil {
 				_ = rc.Close()
-				return false
+				return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("cannot decompress deflate block: %s", ocfr.rerr))
 			}
-			if ocfr.rerr = rc.Close(); ocfr.rerr != nil {
-				return false
+			if err := rc.Close(); err != nil {
+				return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("cannot decompress deflate block: %s", err))
 			}
+			ocfr.block = decoded
+			b.DecompressedSize = int64(len(decoded))
 
 		case compressionSnappy:
 			index := len(ocfr.block) - 4 // last 4 bytes is crc32 of decoded block
 			if index <= 0 {
-				ocfr.rerr = fmt.Errorf("cannot decompress snappy without CRC32 checksum: %d", len(ocfr.block))
-				return false
+				return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("cannot decompress snappy without CRC32 checksum: %d", len(ocfr.block)))
 			}
 			decoded, err := snappy.Decode(nil, ocfr.block[:index])
 			if err != nil {
-				ocfr.rerr = fmt.Errorf("cannot decompress: %s", err)
-				return false
+				return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("cannot decompress snappy block: %s", err))
 			}
 			actualCRC := crc32.ChecksumIEEE(decoded)
 			expectedCRC := binary.BigEndian.Uint32(ocfr.block[index : index+4])
 			if actualCRC != expectedCRC {
-				ocfr.rerr = fmt.Errorf("snappy CRC32 checksum mismatch: %x != %x", actualCRC, expectedCRC)
-				return false
+				return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("snappy CRC32 checksum mismatch: %x != %x", actualCRC, expectedCRC))
 			}
 			ocfr.block = decoded
+			b.DecompressedSize = int64(len(decoded))
 
 		default:
-			ocfr.rerr = fmt.Errorf("should not get here: cannot compress block using unrecognized compression: %d", ocfr.header.compressionID)
-			return false
+			return ocfr.failBlock(BlockErrorCodec, fmt.Errorf("should not get here: cannot decompress block using unrecognized compression: %d", ocfr.header.compressionID))
 
 		}
 
 		// read and ensure sync marker matches
 		sync := make([]byte, ocfSyncLength)
+		b.SyncOffset = ocfr.cr.consumed
 		var n int
 		if n, ocfr.rerr = io.ReadFull(ocfr.ior, sync); ocfr.rerr != nil {
-			ocfr.rerr = fmt.Errorf("cannot read sync marker: read %d out of %d bytes: %s", n, ocfSyncLength, ocfr.rerr)
-			return false
+			b.EndOffset = ocfr.cr.consumed
+			return ocfr.failBlock(BlockErrorTruncated, fmt.Errorf("cannot read sync marker: read %d out of %d bytes: %s", n, ocfSyncLength, ocfr.rerr))
 		}
 		if !bytes.Equal(sync, ocfr.header.syncMarker[:]) {
-			ocfr.rerr = fmt.Errorf("sync marker mismatch: %v != %v", sync, ocfr.header.syncMarker)
-			return false
+			b.EndOffset = ocfr.cr.consumed
+			return ocfr.failBlock(BlockErrorSync, fmt.Errorf("sync marker mismatch: %v != %v", sync, ocfr.header.syncMarker))
 		}
+		b.SyncVerified = true
+		b.EndOffset = ocfr.cr.consumed
+		// Complete is finalized later, while datum values are decoded, since
+		// it also requires the decoded count to match the declared count.
 	}
 
 	ocfr.readReady = true
@@ -256,6 +321,8 @@ func (ocfr *OCFReader) Scan() bool {
 // start decoding datum values there.
 func (ocfr *OCFReader) SkipThisBlockAndReset() {
 	// ??? is it an error to call method unless the reader has had an error
+	// The failed block's receipt is retained as a historical record and is
+	// never rewritten or replayed; only the in-flight decode state resets.
 	ocfr.remainingBlockItems = 0
 	ocfr.block = ocfr.block[:0]
 	ocfr.rerr = nil
