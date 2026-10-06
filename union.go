@@ -47,11 +47,151 @@ type codecInfo struct {
 //	   fmt.Println(string(buf))
 //	   // Output: {"string":"some string"}
 //	}
+//
+// For cases where the branch cannot be inferred from the datum's Go value
+// type (two records with identical structure but different names, or
+// anonymous primitives that share a Go representation), use NewUnionBranch
+// to supply an explicit branch identity.
 func Union(name string, datum interface{}) interface{} {
 	if datum == nil && name == "null" {
 		return nil
 	}
 	return map[string]interface{}{name: datum}
+}
+
+// UnionBranch carries an explicit union branch identity together with the
+// datum value to encode. It is an alternative to the dynamic `Union` map
+// wrapper for cases where the Go value type alone cannot identify the
+// intended writer-schema branch:
+//
+//   - two named records with identical structure but different names (both
+//     arrive as `map[string]interface{}`), and
+//   - anonymous primitives that share a Go value representation (there is no
+//     reliable way to infer the branch from the bare value).
+//
+// Unlike `Union`, the branch name is never guessed from the datum: it is
+// validated verbatim against the writer schema used to build the codec. A
+// branch name that is not a member of the writer schema causes encoding to
+// fail rather than silently selecting a different branch.
+//
+// `nil` datum is valid only for the `null` branch; a `nil` value explicitly
+// tagged with a non-null branch (or vice versa) is rejected. Use a bare Go
+// `nil`, or `NewUnionBranch("null", nil)`, when the intended branch is
+// `null`.
+type UnionBranch struct {
+	// Branch is the Avro type name of the union member, exactly as it
+	// appears in the writer schema (full name for named types).
+	Branch string
+
+	// Datum is the native Go value for the selected branch.
+	Datum interface{}
+}
+
+// NewUnionBranch is the explicit branch identity entry point for union
+// encoding. It returns a UnionBranch that pins the datum to the specified
+// writer schema branch without attempting to infer the branch from the
+// datum's Go value type.
+//
+//	func ExampleNewUnionBranch() {
+//	   codec, err := goavro.NewCodec(`["null","string","int"]`)
+//	   if err != nil {
+//	       fmt.Println(err)
+//	   }
+//	   buf, err := codec.BinaryFromNative(nil, goavro.NewUnionBranch("string", "some string"))
+//	   if err != nil {
+//	       fmt.Println(err)
+//	   }
+//	   fmt.Printf("%#v", buf)
+//	   // Output: []byte{0x2, 0x16, 's', 'o', 'm', 'e', ' ', 's', 't', 'r', 'i', 'n', 'g'}
+//	}
+func NewUnionBranch(branch string, datum interface{}) UnionBranch {
+	return UnionBranch{Branch: branch, Datum: datum}
+}
+
+// BranchFromNative inspects a native value produced by union decoding (a
+// `map[string]interface{}` with a single key) and returns its explicit
+// branch identity. It also accepts a UnionBranch unchanged, and a bare
+// `nil`, which is reported as the `null` branch. Any other value results in
+// an error.
+//
+// This complements NewUnionBranch on the decode side: callers do not need
+// to reach into the single-entry map to learn which union member the
+// writer selected.
+func BranchFromNative(datum interface{}) (UnionBranch, error) {
+	switch v := datum.(type) {
+	case nil:
+		return UnionBranch{Branch: "null", Datum: nil}, nil
+	case UnionBranch:
+		return v, nil
+	case *UnionBranch:
+		if v == nil {
+			return UnionBranch{}, errors.New("cannot determine union branch: received nil *UnionBranch")
+		}
+		return *v, nil
+	case map[string]interface{}:
+		if len(v) != 1 {
+			return UnionBranch{}, fmt.Errorf("cannot determine union branch: decoded union ought to be a map with a single key; received: %v", v)
+		}
+		for key, value := range v {
+			return UnionBranch{Branch: key, Datum: value}, nil
+		}
+	}
+	return UnionBranch{}, fmt.Errorf("cannot determine union branch: expected nil or single-entry map; received: %T", datum)
+}
+
+// resolvedUnionBranch is the result of matching an encoder input against the
+// union's writer schema members.
+type resolvedUnionBranch struct {
+	index int
+	codec *Codec
+	name  string
+	datum interface{}
+}
+
+// resolveUnionBranch maps an explicit UnionBranch or a legacy dynamic
+// Union map to a member of the writer schema. It never guesses the branch
+// from the datum's Go value type: the branch is taken from the explicit
+// identity and verified against the writer schema.
+func (cr *codecInfo) resolveUnionBranch(datum interface{}) (resolvedUnionBranch, error) {
+	switch v := datum.(type) {
+	case nil:
+		index, ok := cr.indexFromName["null"]
+		if !ok {
+			return resolvedUnionBranch{}, fmt.Errorf("no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
+		}
+		return resolvedUnionBranch{index: index, codec: cr.codecFromIndex[index], name: "null", datum: nil}, nil
+	case UnionBranch:
+		index, ok := cr.indexFromName[v.Branch]
+		if !ok {
+			return resolvedUnionBranch{}, fmt.Errorf("branch %q is not a member of writer schema: no member schema types support datum: allowed types: %v; received: %T", v.Branch, cr.allowedTypes, v.Datum)
+		}
+		if v.Branch == "null" {
+			if v.Datum != nil {
+				return resolvedUnionBranch{}, fmt.Errorf("branch %q requires a nil datum; received: %T", v.Branch, v.Datum)
+			}
+		} else if v.Datum == nil {
+			return resolvedUnionBranch{}, fmt.Errorf("non-null branch %q requires a non-nil datum; received: %T", v.Branch, v.Datum)
+		}
+		return resolvedUnionBranch{index: index, codec: cr.codecFromIndex[index], name: v.Branch, datum: v.Datum}, nil
+	case *UnionBranch:
+		if v == nil {
+			break
+		}
+		return cr.resolveUnionBranch(*v)
+	case map[string]interface{}:
+		if len(v) != 1 {
+			break
+		}
+		// will execute exactly once
+		for key, value := range v {
+			index, ok := cr.indexFromName[key]
+			if !ok {
+				return resolvedUnionBranch{}, fmt.Errorf("no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
+			}
+			return resolvedUnionBranch{index: index, codec: cr.codecFromIndex[index], name: key, datum: value}, nil
+		}
+	}
+	return resolvedUnionBranch{}, fmt.Errorf("non-nil values ought to be specified with NewUnionBranch or a map[string]interface{} with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
 }
 
 // makeCodecInfo takes the schema array
@@ -116,29 +256,22 @@ func unionNativeFromBinary(cr *codecInfo) func(buf []byte) (interface{}, []byte,
 }
 func unionBinaryFromNative(cr *codecInfo) func(buf []byte, datum interface{}) ([]byte, error) {
 	return func(buf []byte, datum interface{}) ([]byte, error) {
-		switch v := datum.(type) {
-		case nil:
-			index, ok := cr.indexFromName["null"]
-			if !ok {
-				return nil, fmt.Errorf("cannot encode binary union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-			}
-			return longBinaryFromNative(buf, index)
-		case map[string]interface{}:
-			if len(v) != 1 {
-				return nil, fmt.Errorf("cannot encode binary union: non-nil Union values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
-			}
-			// will execute exactly once
-			for key, value := range v {
-				index, ok := cr.indexFromName[key]
-				if !ok {
-					return nil, fmt.Errorf("cannot encode binary union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-				}
-				c := cr.codecFromIndex[index]
-				buf, _ = longBinaryFromNative(buf, index)
-				return c.binaryFromNative(buf, value)
-			}
+		rb, err := cr.resolveUnionBranch(datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode binary union: %s", err)
 		}
-		return nil, fmt.Errorf("cannot encode binary union: non-nil Union values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
+		// Encode the branch index and the member datum into a scratch buffer
+		// first, so a member encoding failure does not publish a partially
+		// written branch index (or member prefix) into the caller's buffer.
+		scratch, err := longBinaryFromNative(nil, rb.index)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode binary union item %d: %s", rb.index+1, err)
+		}
+		scratch, err = rb.codec.binaryFromNative(scratch, rb.datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode binary union item %d: %s", rb.index+1, err)
+		}
+		return append(buf, scratch...), nil
 	}
 }
 func unionNativeFromTextual(cr *codecInfo) func(buf []byte) (interface{}, []byte, error) {
@@ -162,70 +295,52 @@ func unionNativeFromTextual(cr *codecInfo) func(buf []byte) (interface{}, []byte
 }
 func unionTextualFromNative(cr *codecInfo) func(buf []byte, datum interface{}) ([]byte, error) {
 	return func(buf []byte, datum interface{}) ([]byte, error) {
-		switch v := datum.(type) {
-		case nil:
-			_, ok := cr.indexFromName["null"]
-			if !ok {
-				return nil, fmt.Errorf("cannot encode textual union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-			}
-			return append(buf, "null"...), nil
-		case map[string]interface{}:
-			if len(v) != 1 {
-				return nil, fmt.Errorf("cannot encode textual union: non-nil Union values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
-			}
-			// will execute exactly once
-			for key, value := range v {
-				index, ok := cr.indexFromName[key]
-				if !ok {
-					return nil, fmt.Errorf("cannot encode textual union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-				}
-				buf = append(buf, '{')
-				var err error
-				buf, err = stringTextualFromNative(buf, key)
-				if err != nil {
-					return nil, fmt.Errorf("cannot encode textual union: %s", err)
-				}
-				buf = append(buf, ':')
-				c := cr.codecFromIndex[index]
-				buf, err = c.textualFromNative(buf, value)
-				if err != nil {
-					return nil, fmt.Errorf("cannot encode textual union: %s", err)
-				}
-				return append(buf, '}'), nil
-			}
+		rb, err := cr.resolveUnionBranch(datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode textual union: %s", err)
 		}
-		return nil, fmt.Errorf("cannot encode textual union: non-nil values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
+		// Build the member JSON in a scratch buffer so a member encoding
+		// failure does not leave a partially written prefix in the caller's
+		// buffer. This also validates the datum, e.g. a non-nil value given
+		// for the null branch is rejected by the null codec.
+		scratch, err := rb.codec.textualFromNative(nil, rb.datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode textual union: %s", err)
+		}
+		// The null member is encoded as a bare `null`; every other member is
+		// wrapped as `{"branchName":value}`.
+		if rb.name == "null" {
+			return append(buf, scratch...), nil
+		}
+		wrapped := make([]byte, 0, len(scratch)+len(rb.name)+4)
+		wrapped = append(wrapped, '{')
+		wrapped, err = stringTextualFromNative(wrapped, rb.name)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode textual union: %s", err)
+		}
+		wrapped = append(wrapped, ':')
+		wrapped = append(wrapped, scratch...)
+		wrapped = append(wrapped, '}')
+		return append(buf, wrapped...), nil
 	}
 }
 func textualJSONFromNativeAvro(cr *codecInfo) func(buf []byte, datum interface{}) ([]byte, error) {
 	return func(buf []byte, datum interface{}) ([]byte, error) {
-		switch v := datum.(type) {
-		case nil:
-			_, ok := cr.indexFromName["null"]
-			if !ok {
-				return nil, fmt.Errorf("cannot encode textual union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-			}
-			return append(buf, "null"...), nil
-		case map[string]interface{}:
-			if len(v) != 1 {
-				return nil, fmt.Errorf("cannot encode textual union: non-nil Union values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
-			}
-			// will execute exactly once
-			for key, value := range v {
-				index, ok := cr.indexFromName[key]
-				if !ok {
-					return nil, fmt.Errorf("cannot encode textual union: no member schema types support datum: allowed types: %v; received: %T", cr.allowedTypes, datum)
-				}
-				var err error
-				c := cr.codecFromIndex[index]
-				buf, err = c.textualFromNative(buf, value)
-				if err != nil {
-					return nil, fmt.Errorf("cannot encode textual union: %s", err)
-				}
-				return buf, nil
-			}
+		rb, err := cr.resolveUnionBranch(datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode textual union: %s", err)
 		}
-		return nil, fmt.Errorf("cannot encode textual union: non-nil values ought to be specified with Go map[string]interface{}, with single key equal to type name, and value equal to datum value: %v; received: %T", cr.allowedTypes, datum)
+		if rb.name == "null" {
+			return append(buf, "null"...), nil
+		}
+		// Standard JSON emits the member value without the Avro union
+		// wrapper. Encode into a scratch buffer so a member failure does not
+		// publish partial bytes to the caller's buffer.
+		scratch, err := rb.codec.textualFromNative(nil, rb.datum)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encode textual union: %s", err)
+		}
+		return append(buf, scratch...), nil
 	}
 }
 func buildCodecForTypeDescribedBySlice(st map[string]*Codec, enclosingNamespace string, schemaArray []interface{}, cb *codecBuilder) (*Codec, error) {

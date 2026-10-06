@@ -386,6 +386,80 @@ func ExampleUnion() {
 }
 ```
 
+#### Explicit Union Branch Identity
+
+The `Union` map is a dynamic interface: the branch name and the datum
+are carried in the same single-entry map. The Go value type alone is
+not always enough to know which writer schema branch was intended. Two
+named records with different names but identical structure both arrive
+as `map[string]interface{}`, and anonymous primitives can share a Go
+representation. For these cases use `NewUnionBranch`, which pins a
+datum to an explicit branch without guessing from its Go type:
+
+```Go
+// Schema 1: a union of null plus two records with identical structure
+// but different names.
+recordUnionCodec, _ := goavro.NewCodec(`
+    {
+      "type": "record",
+      "name": "Envelope",
+      "fields": [{
+        "name": "pet",
+        "type": [
+          "null",
+          {"type": "record", "name": "Dog", "fields": [{"name": "name", "type": "string"}]},
+          {"type": "record", "name": "Cat", "fields": [{"name": "name", "type": "string"}]}
+        ]
+      }]
+    }`)
+
+// Schema 2/3: the two same-shaped records are reached by branch name,
+// never by inspecting the Go map.
+dogBytes, _ := recordUnionCodec.BinaryFromNative(nil, map[string]interface{}{
+    "pet": goavro.NewUnionBranch("Dog", map[string]interface{}{"name": "lassie"}),
+})
+catBytes, _ := recordUnionCodec.BinaryFromNative(nil, map[string]interface{}{
+    "pet": goavro.NewUnionBranch("Cat", map[string]interface{}{"name": "rex"}),
+})
+
+// A bare union of anonymous primitives works the same way.
+primitiveCodec, _ := goavro.NewCodec(`["null","int","long","string"]`)
+intBytes, _ := primitiveCodec.BinaryFromNative(nil, goavro.NewUnionBranch("int", 3))
+longBytes, _ := primitiveCodec.BinaryFromNative(nil, goavro.NewUnionBranch("long", 3))
+```
+
+Rules enforced by `NewUnionBranch`:
+
+- The branch name must be a member of the **writer schema** used to
+  build the codec. Selecting a branch that is not present fails rather
+  than silently encoding the datum as another compatible branch.
+- `nil` is valid only for the `null` branch; a `nil` datum tagged with
+  a non-null branch, or a non-`nil` datum tagged `null`, is rejected.
+  An explicit `null` value is therefore distinct from a record field
+  that is omitted and falls back to its `default`.
+- A record field's union `default` is validated against the real rules
+  of the **first branch**, per the Avro specification.
+- If a member datum fails to encode, no partially written branch index
+  (or member prefix) is appended to the output buffer.
+
+On the decode side, `BranchFromNative` recovers the explicit branch
+identity and datum from a decoded union without reaching into the
+single-entry map by hand:
+
+```Go
+native, _, _ := primitiveCodec.NativeFromBinary(longBytes)
+choice, _ := goavro.BranchFromNative(native) // choice.Branch == "long"
+```
+
+The ordinary dynamic `Union` interface continues to work unchanged.
+
+The acceptance tests, including the three-schema example, live in
+`union_branch_test.go` and can be run with:
+
+```sh
+go test -run 'TestUnionExplicitBranch|TestUnionDefaultFirstBranch|TestUnionNoPartialBinary' -v .
+```
+
 ## Limitations
 
 Goavro is a fully featured encoder and decoder of binary and textual
