@@ -386,6 +386,46 @@ func ExampleUnion() {
 }
 ```
 
+#### Explicit Union Branch Identity
+
+The dynamic `map[string]interface{}` form names a branch by its map key,
+but the branch still has to be inferred from that name rather than from
+the Go value. This is ambiguous in two common cases:
+
+- two named `record` types that have identical structure but different
+  Avro names both encode from the same `map[string]interface{}`; and
+- two anonymous members can share one Go type, for example `bytes` and
+  `fixed` both use `[]byte`, and `int` and `long` both use integers.
+
+For these cases, provide the branch identity explicitly with
+`NewUnionBranch`. The branch must name a member of the writer schema
+(either its short name, when unambiguous, or its full name); selecting a
+branch the schema does not declare returns an error, and no partial data
+is written.
+
+```Go
+codec, err := goavro.NewCodec(`[
+  {"type":"record","name":"Person","fields":[{"name":"id","type":"int"}]},
+  {"type":"record","name":"Robot","fields":[{"name":"id","type":"int"}]}
+]`)
+
+value := map[string]interface{}{"id": int32(7)}
+
+// Same Go value, explicitly different union branches:
+buf1, _ := codec.BinaryFromNative(nil, goavro.NewUnionBranch("Person", value))
+buf2, _ := codec.BinaryFromNative(nil, goavro.NewUnionBranch("Robot", value))
+// buf1 == []byte{0x00, 0x0e}  (discriminator 0)
+// buf2 == []byte{0x02, 0x0e}  (discriminator 2)
+```
+
+`null` is still selected with `nil`, and is distinct from omitting a
+record field: an omitted field takes the union's default, which is
+validated against the real rules of the union's *first* member, whereas
+`NewUnionBranch("null", nil)` writes the null branch explicitly. After
+decoding, `UnionBranchFromNative` returns the branch name together with
+the decoded value. The ordinary dynamic `nil` / `Union(name, value)`
+interface continues to work unchanged.
+
 ## Limitations
 
 Goavro is a fully featured encoder and decoder of binary and textual
