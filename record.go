@@ -13,6 +13,32 @@ import (
 	"fmt"
 )
 
+// copyDefaultValue returns an independent copy of a record field default
+// value, recursively duplicating maps and slices, so that records decoded
+// with missing fields never share mutable default value instances.
+func copyDefaultValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		copied := make(map[string]interface{}, len(v))
+		for key, item := range v {
+			copied[key] = copyDefaultValue(item)
+		}
+		return copied
+	case []interface{}:
+		copied := make([]interface{}, len(v))
+		for i, item := range v {
+			copied[i] = copyDefaultValue(item)
+		}
+		return copied
+	case []byte:
+		copied := make([]byte, len(v))
+		copy(copied, v)
+		return copied
+	default:
+		return value
+	}
+}
+
 func makeRecordCodec(st map[string]*Codec, enclosingNamespace string, schemaMap map[string]interface{}, cb *codecBuilder) (*Codec, error) {
 	// NOTE: To support recursive data types, create the codec and register it
 	// using the specified name, and fill in the codec functions later.
@@ -209,10 +235,13 @@ func makeRecordCodec(st map[string]*Codec, enclosingNamespace string, schemaMap 
 		}
 		if actual, expected := len(mapValues), len(codecFromFieldName); actual != expected {
 			// set missing field keys to their respective default values, then
-			// re-check number of keys
+			// re-check number of keys. NOTE: copy each default value so that
+			// mutable maps and slices are not shared between decoded records;
+			// an explicit null in the input is left as-is (it follows the
+			// union null branch) and is never replaced by a default value.
 			for fieldName, defaultValue := range defaultValueFromName {
 				if _, ok := mapValues[fieldName]; !ok {
-					mapValues[fieldName] = defaultValue
+					mapValues[fieldName] = copyDefaultValue(defaultValue)
 				}
 			}
 			if actual, expected = len(mapValues), len(codecFromFieldName); actual != expected {
