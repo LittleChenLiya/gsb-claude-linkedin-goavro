@@ -212,7 +212,11 @@ func makeRecordCodec(st map[string]*Codec, enclosingNamespace string, schemaMap 
 			// re-check number of keys
 			for fieldName, defaultValue := range defaultValueFromName {
 				if _, ok := mapValues[fieldName]; !ok {
-					mapValues[fieldName] = defaultValue
+					// NOTE: Each decoded record must receive its own
+					// independent copy of the default value, so that maps and
+					// slices in the default are never shared between two
+					// decoded records.
+					mapValues[fieldName] = copyDefaultValue(defaultValue)
 				}
 			}
 			if actual, expected = len(mapValues), len(codecFromFieldName); actual != expected {
@@ -250,4 +254,31 @@ func makeRecordCodec(st map[string]*Codec, enclosingNamespace string, schemaMap 
 	}
 
 	return c, nil
+}
+
+// copyDefaultValue returns an independent copy of a record field default
+// value, recursively duplicating maps, slices, and byte slices so that a
+// default value substituted for a missing field is never shared between two
+// decoded records. Scalar values are returned as-is.
+func copyDefaultValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		copied := make(map[string]interface{}, len(v))
+		for key, item := range v {
+			copied[key] = copyDefaultValue(item)
+		}
+		return copied
+	case []interface{}:
+		copied := make([]interface{}, len(v))
+		for i, item := range v {
+			copied[i] = copyDefaultValue(item)
+		}
+		return copied
+	case []byte:
+		copied := make([]byte, len(v))
+		copy(copied, v)
+		return copied
+	default:
+		return value
+	}
 }

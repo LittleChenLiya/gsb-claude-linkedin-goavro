@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"reflect"
 	"testing"
 )
 
@@ -872,4 +873,132 @@ func TestRecordFieldDefaultValueTypes(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestRecordDefaultValueIndependentInstances(t *testing.T) {
+	// Two records decoded while omitting fields that have composite (map or
+	// slice) default values must not share those default value instances:
+	// mutating the first decoded record must not affect the second.
+	codec, err := NewCodec(`{
+  "type": "record",
+  "name": "r1",
+  "fields": [
+    {"name": "id", "type": "int"},
+    {"name": "inner", "type": {"type": "record", "name": "innerRec", "fields": [{"name": "n", "type": "int"}]}, "default": {"n": 1}},
+    {"name": "tags", "type": {"type": "array", "items": "string"}, "default": ["a", "b"]},
+    {"name": "props", "type": {"type": "map", "values": "long"}, "default": {"k": 7}}
+  ]
+}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := []byte(`{"id": 13}`)
+
+	first, _, err := codec.NativeFromTextual(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := codec.NativeFromTextual(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstMap := first.(map[string]interface{})
+	secondMap := second.(map[string]interface{})
+
+	// Mutate every composite default value in the first decoded record.
+	firstMap["inner"].(map[string]interface{})["n"] = float64(99)
+	firstMap["tags"].([]interface{})[0] = "mutated"
+	firstMap["props"].(map[string]interface{})["k"] = float64(99)
+
+	// The second decoded record must be unaffected.
+	if got, want := secondMap["inner"].(map[string]interface{})["n"], float64(1); got != want {
+		t.Errorf("GOT: %v; WANT: %v", got, want)
+	}
+	if got, want := secondMap["tags"].([]interface{})[0], "a"; got != want {
+		t.Errorf("GOT: %v; WANT: %v", got, want)
+	}
+	if got, want := secondMap["props"].(map[string]interface{})["k"], float64(7); got != want {
+		t.Errorf("GOT: %v; WANT: %v", got, want)
+	}
+}
+
+func TestRecordExplicitNullUnionNotReplacedByDefault(t *testing.T) {
+	// An explicit null in the input must follow the union null branch rather
+	// than being replaced by the field default value.
+	codec, err := NewCodec(`{
+  "type": "record",
+  "name": "r1",
+  "fields": [
+    {"name": "f1", "type": ["string", "null"], "default": "foo"}
+  ]
+}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing field: default value applies.
+	native, _, err := codec.NativeFromTextual([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := native.(map[string]interface{})["f1"], map[string]interface{}{"string": "foo"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("GOT: %#v; WANT: %#v", got, want)
+	}
+
+	// Explicit null: union null branch applies, not the default value.
+	native, _, err = codec.NativeFromTextual([]byte(`{"f1": null}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := native.(map[string]interface{})["f1"]; got != nil {
+		t.Errorf("GOT: %#v; WANT: nil", got)
+	}
+}
+
+func TestRecordFieldNestedInvalidDefaultValue(t *testing.T) {
+	// Invalid default values are rejected when the codec is constructed.
+	testSchemaInvalid(t,
+		`{"type":"record","name":"r1","fields":[{"name":"f1","type":{"type":"record","name":"r2","fields":[{"name":"n","type":"int"}]},"default":{"n":"foo"}}]}`,
+		"default value ought to encode using field schema")
+	testSchemaInvalid(t,
+		`{"type":"record","name":"r1","fields":[{"name":"f1","type":{"type":"array","items":"int"},"default":["foo"]}]}`,
+		"default value ought to encode using field schema")
+}
+
+func ExampleCodec_NativeFromTextual_defaultValueIndependentInstances() {
+	codec, err := NewCodec(`{
+  "type": "record",
+  "name": "r1",
+  "fields": [
+    {"name": "id", "type": "int"},
+    {"name": "tags", "type": {"type": "array", "items": "string"}, "default": ["a"]}
+  ]
+}`)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// Decode two records, both omitting the field that has a default value.
+	first, _, err := codec.NativeFromTextual([]byte(`{"id": 1}`))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	second, _, err := codec.NativeFromTextual([]byte(`{"id": 2}`))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// Mutating the default-filled slice of the first record does not affect
+	// the second record: each decode receives an independent copy.
+	first.(map[string]interface{})["tags"].([]interface{})[0] = "mutated"
+
+	fmt.Println(first.(map[string]interface{})["tags"].([]interface{})[0])
+	fmt.Println(second.(map[string]interface{})["tags"].([]interface{})[0])
+	// Output: mutated
+	// a
 }
