@@ -22,6 +22,21 @@ import (
 	"github.com/golang/snappy"
 )
 
+// OCFMetaDataEntry is a single application specific metadata item to be
+// stored in the OCF header. It is used by OCFConfig.MetaDataEntries, the
+// safe metadata modification entry point.
+type OCFMetaDataEntry struct {
+	// Key specifies the metadata key. Keys having the reserved "avro."
+	// prefix, such as "avro.schema" and "avro.codec", are rejected with an
+	// error before the OCF header is written.
+	Key string
+
+	// Value specifies the metadata value. The value is copied when the
+	// OCFWriter is created, so later mutation of this byte slice cannot
+	// modify the generated header.
+	Value []byte
+}
+
 // OCFConfig is used to specify creation parameters for OCFWriter.
 type OCFConfig struct {
 	// W specifies the `io.Writer` to which to send the encoded data,
@@ -55,6 +70,15 @@ type OCFConfig struct {
 	// the OCF file.  When appending to an existing OCF, this field
 	// is ignored.
 	MetaData map[string][]byte
+
+	// MetaDataEntries specifies application specific meta data to be added
+	// to the OCF file, (optional). It is the safe metadata modification
+	// entry point: every key is validated against the reserved "avro."
+	// prefix, and every value is copied, before the OCF header is written
+	// out. Entries are applied in order after the MetaData map above, so an
+	// entry overrides a map item having the same key. When appending to an
+	// existing OCF, this field is ignored.
+	MetaDataEntries []OCFMetaDataEntry
 
 	// SyncMarker specifies the sync block (optional). When not set, it will be
 	// randomly generated
@@ -228,6 +252,18 @@ func (ocfw *OCFWriter) appendDataIntoBlock(data []interface{}) error {
 
 	_, err = ocfw.iow.Write(buf)
 	return err
+}
+
+// MetaData returns a copy of the metadata stored in the OCF header used by
+// OCFWriter. Both the map and every byte slice value are freshly allocated,
+// so mutation of the returned values cannot modify the header that has been
+// generated.
+func (ocfw *OCFWriter) MetaData() map[string][]byte {
+	metadata := make(map[string][]byte, len(ocfw.header.metadata))
+	for k, v := range ocfw.header.metadata {
+		metadata[k] = copyOCFMetaDataValue(v)
+	}
+	return metadata
 }
 
 // Codec returns the codec used by OCFWriter. This function provided because

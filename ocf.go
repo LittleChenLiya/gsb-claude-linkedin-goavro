@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 )
 
 const (
@@ -44,18 +46,36 @@ const (
 	ocfBlockConst      = 24 // Each OCF block has two longs prefix, and sync marker suffix
 	ocfHeaderSizeConst = 48 // OCF header is usually about 48 bytes longer than its compressed schema
 	ocfMagicString     = "Obj\x01"
-	ocfMetadataSchema  = `{"type":"map","values":"bytes"}`
 	ocfSyncLength      = 16
+
+	// ocfReservedMetaDataPrefix is the prefix reserved by the Avro
+	// specification for OCF header metadata keys, e.g. "avro.schema" and
+	// "avro.codec".
+	ocfReservedMetaDataPrefix = "avro."
 )
 
-var (
-	ocfMagicBytes    = []byte(ocfMagicString)
-	ocfMetadataCodec *Codec
-)
-
-func init() {
-	ocfMetadataCodec, _ = NewCodec(ocfMetadataSchema)
+// checkOCFMetaDataKey returns an error when the specified metadata key is
+// reserved by the Avro specification and therefore may not be used as a
+// custom metadata key.
+func checkOCFMetaDataKey(key string) error {
+	if strings.HasPrefix(key, ocfReservedMetaDataPrefix) {
+		return fmt.Errorf("cannot use reserved OCF metadata key: %q", key)
+	}
+	return nil
 }
+
+// copyOCFMetaDataValue returns a copy of the specified metadata value so the
+// caller and the OCF header do not share the same underlying byte slice.
+func copyOCFMetaDataValue(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+	copied := make([]byte, len(value))
+	copy(copied, value)
+	return copied
+}
+
+var ocfMagicBytes = []byte(ocfMagicString)
 
 type ocfHeader struct {
 	codec         *Codec
@@ -99,7 +119,28 @@ func newOCFHeader(config OCFConfig) (*ocfHeader, error) {
 		}
 	}
 
-	header.metadata = config.MetaData
+	//
+	// custom metadata
+	//
+	// Copy every metadata value so later mutation of caller-provided byte
+	// slices cannot modify the header that has been (or will be) written.
+	//
+	header.metadata = make(map[string][]byte, len(config.MetaData)+len(config.MetaDataEntries))
+	for k, v := range config.MetaData {
+		header.metadata[k] = copyOCFMetaDataValue(v)
+	}
+	// MetaDataEntries is the safe metadata modification entry point: every
+	// key is validated against the reserved "avro." prefix before the header
+	// is written out, and every value is defensively copied. Entries are
+	// applied in order, so a later entry overrides an earlier entry (or a
+	// MetaData map item) having the same key.
+	for _, entry := range config.MetaDataEntries {
+		if err = checkOCFMetaDataKey(entry.Key); err != nil {
+			return nil, err
+		}
+		header.metadata[entry.Key] = copyOCFMetaDataValue(entry.Value)
+	}
+
 	header.syncMarker = config.SyncMarker
 
 	if header.syncMarker == [16]byte{} {
@@ -218,15 +259,35 @@ func writeOCFHeader(header *ocfHeader, iow io.Writer) (err error) {
 	//
 	// file metadata, including the schema
 	//
-	meta := make(map[string]interface{})
+	meta := make(map[string][]byte, len(header.metadata)+2)
 	for k, v := range header.metadata {
 		meta[k] = v
 	}
 	meta["avro.schema"] = []byte(schema)
 	meta["avro.codec"] = []byte(avroCodec)
 
-	buf, err = ocfMetadataCodec.BinaryFromNative(buf, meta)
+	// Sort the metadata keys so the encoded header is deterministic: the
+	// same metadata always yields the same header bytes, and custom keys
+	// appear in a stable order.
+	keys := make([]string, 0, len(meta))
+	for k := range meta {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf, err = longBinaryFromNative(buf, len(keys))
 	if err != nil {
+		return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+	}
+	for _, k := range keys {
+		if buf, err = stringBinaryFromNative(buf, k); err != nil {
+			return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+		}
+		if buf, err = bytesBinaryFromNative(buf, meta[k]); err != nil {
+			return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+		}
+	}
+	if buf, err = longBinaryFromNative(buf, 0); err != nil {
 		return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
 	}
 
