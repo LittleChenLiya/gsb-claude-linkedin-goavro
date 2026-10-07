@@ -56,9 +56,44 @@ type OCFConfig struct {
 	// is ignored.
 	MetaData map[string][]byte
 
+	// MetaDataSafe opts in to safe handling of the custom OCF metadata
+	// supplied via the MetaData field (or via SetMetaData). When true:
+	//
+	//   - MetaData values are deep copied when the OCF header is built, so
+	//     mutating the byte slices held by the caller cannot change the
+	//     generated header.
+	//   - Reserved metadata keys beginning with "avro.", including
+	//     "avro.schema" and "avro.codec", are rejected and NewOCFWriter
+	//     returns an error before any header byte is written.
+	//   - Custom metadata keys are serialized in lexicographic order, giving
+	//     the generated header a stable, deterministic layout.
+	//
+	// When false (the zero value), behavior is unchanged from previous
+	// versions: MetaData is used as provided, reserved keys are overwritten
+	// by the writer, and metadata keys are encoded in map iteration order.
+	MetaDataSafe bool
+
 	// SyncMarker specifies the sync block (optional). When not set, it will be
 	// randomly generated
 	SyncMarker [16]byte
+}
+
+// SetMetaData is a safe modification entry point for OCF custom metadata. It
+// stores a deep copy of md, so later mutation of the caller's byte slices
+// cannot affect the OCF header, and it enables MetaDataSafe. Keys beginning
+// with "avro." are reserved by the Avro specification and are rejected with
+// an error rather than stored. SetMetaData may be called repeatedly on an
+// OCFConfig before it is passed to NewOCFWriter; each call replaces the
+// previously stored metadata.
+func (config *OCFConfig) SetMetaData(md map[string][]byte) error {
+	for key := range md {
+		if isReservedMetadataKey(key) {
+			return fmt.Errorf("cannot set reserved OCF metadata key: %q", key)
+		}
+	}
+	config.MetaData = cloneMetaData(md)
+	config.MetaDataSafe = true
+	return nil
 }
 
 // OCFWriter is used to create a new or append to an existing Avro Object
@@ -235,6 +270,22 @@ func (ocfw *OCFWriter) appendDataIntoBlock(data []interface{}) error {
 // requested during instantiation.
 func (ocfw *OCFWriter) Codec() *Codec {
 	return ocfw.header.codec
+}
+
+// MetaData returns a deep copy of the custom metadata stored in the OCF
+// header. Mutating the returned map or any of its byte slice values can never
+// change the header already written by this OCFWriter, nor the metadata
+// returned by subsequent calls. The reserved "avro.schema" and "avro.codec"
+// entries are not included, because they are managed by the writer itself.
+func (ocfw *OCFWriter) MetaData() map[string][]byte {
+	meta := make(map[string][]byte, len(ocfw.header.metadata))
+	for k, v := range ocfw.header.metadata {
+		if isReservedMetadataKey(k) {
+			continue
+		}
+		meta[k] = append([]byte(nil), v...)
+	}
+	return meta
 }
 
 // CompressionName returns the name of the compression algorithm used by

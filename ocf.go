@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 )
 
 const (
@@ -46,6 +48,15 @@ const (
 	ocfMagicString     = "Obj\x01"
 	ocfMetadataSchema  = `{"type":"map","values":"bytes"}`
 	ocfSyncLength      = 16
+
+	// avroSchemaKey and avroCodecKey are the reserved OCF metadata keys
+	// defined by the Avro specification.
+	avroSchemaKey = "avro.schema"
+	avroCodecKey  = "avro.codec"
+
+	// ocfReservedKeyPrefix is the prefix of metadata keys reserved by the
+	// Avro specification. Custom metadata keys must not begin with "avro.".
+	ocfReservedKeyPrefix = "avro."
 )
 
 var (
@@ -62,6 +73,31 @@ type ocfHeader struct {
 	compressionID compressionID
 	syncMarker    [ocfSyncLength]byte
 	metadata      map[string][]byte
+	// metaDataSafe, when true, means metadata holds a private deep copy of
+	// caller supplied data, reserved metadata keys were rejected during header
+	// creation, and the header must serialize metadata keys in sorted order.
+	metaDataSafe bool
+}
+
+// isReservedMetadataKey reports whether key is reserved for use by the Avro
+// specification. Metadata keys beginning with "avro.", such as "avro.schema"
+// and "avro.codec", are reserved.
+func isReservedMetadataKey(key string) bool {
+	return strings.HasPrefix(key, ocfReservedKeyPrefix)
+}
+
+// cloneMetaData returns a deep copy of m, so later mutation of the caller's
+// keys or byte slice values cannot affect copied data. A nil map yields a nil
+// result, preserving the distinction between "no metadata" and "empty map".
+func cloneMetaData(m map[string][]byte) map[string][]byte {
+	if m == nil {
+		return nil
+	}
+	cloned := make(map[string][]byte, len(m))
+	for k, v := range m {
+		cloned[k] = append([]byte(nil), v...)
+	}
+	return cloned
 }
 
 func newOCFHeader(config OCFConfig) (*ocfHeader, error) {
@@ -99,7 +135,27 @@ func newOCFHeader(config OCFConfig) (*ocfHeader, error) {
 		}
 	}
 
-	header.metadata = config.MetaData
+	if config.MetaDataSafe {
+		// Validate every custom metadata key before the header is written.
+		// Reserved keys ("avro.*") are always emitted by the writer itself, so
+		// accepting them here would either silently overwrite the Avro schema
+		// and codec values or let caller input drive them. The check happens
+		// here, before writeOCFHeader and therefore before any byte is written
+		// to the output stream.
+		for key := range config.MetaData {
+			if isReservedMetadataKey(key) {
+				return nil, fmt.Errorf("cannot create OCF header with reserved metadata key: %q", key)
+			}
+		}
+		// Defensively copy caller provided values so later mutation of the
+		// caller's map or byte slices cannot change the generated header.
+		header.metadata = cloneMetaData(config.MetaData)
+		header.metaDataSafe = true
+	} else {
+		// Legacy behavior: keep the caller's map as-is, including any reserved
+		// keys (which are overwritten by the canonical avro.* values below).
+		header.metadata = config.MetaData
+	}
 	header.syncMarker = config.SyncMarker
 
 	if header.syncMarker == [16]byte{} {
@@ -148,7 +204,7 @@ func readOCFHeader(ior io.Reader) (*ocfHeader, error) {
 	// happens a lot, and don't want to accept bad input unless we have
 	// significant reason to do so.
 	var cID compressionID
-	value, ok := metadata["avro.codec"]
+	value, ok := metadata[avroCodecKey]
 	if ok {
 		switch avroCodec := string(value); avroCodec {
 		case CompressionNullLabel:
@@ -165,7 +221,7 @@ func readOCFHeader(ior io.Reader) (*ocfHeader, error) {
 	//
 	// create goavro.Codec from specified avro.schema
 	//
-	value, ok = metadata["avro.schema"]
+	value, ok = metadata[avroSchemaKey]
 	if !ok {
 		return nil, errors.New("cannot read OCF header without avro.schema")
 	}
@@ -215,19 +271,30 @@ func writeOCFHeader(header *ocfHeader, iow io.Writer) (err error) {
 	buf := make([]byte, 4, len(schema)+ocfHeaderSizeConst)
 	_ = copy(buf, ocfMagicBytes)
 
-	//
-	// file metadata, including the schema
-	//
-	meta := make(map[string]interface{})
-	for k, v := range header.metadata {
-		meta[k] = v
-	}
-	meta["avro.schema"] = []byte(schema)
-	meta["avro.codec"] = []byte(avroCodec)
+	if header.metaDataSafe {
+		// Serialize the metadata map in a single block with keys in
+		// lexicographic order. This gives ordinary custom keys a stable,
+		// deterministic position in the generated header regardless of Go's
+		// randomized map iteration order.
+		buf, err = writeOCFMetadataSorted(buf, header.metadata, schema, avroCodec)
+		if err != nil {
+			return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+		}
+	} else {
+		//
+		// file metadata, including the schema
+		//
+		meta := make(map[string]interface{})
+		for k, v := range header.metadata {
+			meta[k] = v
+		}
+		meta[avroSchemaKey] = []byte(schema)
+		meta[avroCodecKey] = []byte(avroCodec)
 
-	buf, err = ocfMetadataCodec.BinaryFromNative(buf, meta)
-	if err != nil {
-		return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+		buf, err = ocfMetadataCodec.BinaryFromNative(buf, meta)
+		if err != nil {
+			return fmt.Errorf("should not get here: cannot write OCF header: %s", err)
+		}
 	}
 
 	//
@@ -241,4 +308,39 @@ func writeOCFHeader(header *ocfHeader, iow io.Writer) (err error) {
 		return fmt.Errorf("cannot write OCF header: %s", err)
 	}
 	return nil
+}
+
+// writeOCFMetadataSorted appends the OCF metadata map, encoded as an Avro
+// map of bytes, to buf with every key serialized in lexicographic order. The
+// reserved avro.schema and avro.codec entries are added to the custom
+// metadata before sorting, so the complete header is deterministic. All
+// entries are emitted in a single map block, followed by the map's zero
+// block-count terminator.
+func writeOCFMetadataSorted(buf []byte, custom map[string][]byte, schema, codec string) ([]byte, error) {
+	keys := make([]string, 0, len(custom)+2)
+	for k := range custom {
+		keys = append(keys, k)
+	}
+	keys = append(keys, avroSchemaKey, avroCodecKey)
+	sort.Strings(keys)
+
+	var err error
+	// One block containing every entry.
+	buf, _ = longBinaryFromNative(buf, int64(len(keys)))
+	for _, k := range keys {
+		buf, _ = stringBinaryFromNative(buf, k)
+		switch k {
+		case avroSchemaKey:
+			buf, err = bytesBinaryFromNative(buf, []byte(schema))
+		case avroCodecKey:
+			buf, err = bytesBinaryFromNative(buf, []byte(codec))
+		default:
+			buf, err = bytesBinaryFromNative(buf, custom[k])
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Zero block count signals end of map.
+	return longBinaryFromNative(buf, 0)
 }
